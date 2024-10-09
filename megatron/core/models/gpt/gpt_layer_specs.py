@@ -10,6 +10,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.tutel_moe_layer import MoELayer as TutelMoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
@@ -165,8 +166,14 @@ def _get_mlp_module_spec(
 
         use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
 
+        import os, torch
+        use_tutel = (int(os.environ.get('USE_TUT', 0)) > 0)
+        if use_tutel:
+            num_devices = torch.distributed.get_world_size()
+            tot_experts = int(os.environ['MOE'])
+            os.environ['TUT'] = str(tot_experts // num_devices) if tot_experts >= num_devices else str(num_devices // tot_experts)
         return ModuleSpec(
-            module=MoELayer,
+            module=MoELayer if not use_tutel else TutelMoELayer,
             submodules=(
                 MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
                 if not moe_grouped_gemm or use_te_grouped_gemm

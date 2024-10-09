@@ -188,6 +188,10 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
+distr_opt = int(os.environ.get('OPT', 0))
+global_rank = int(os.environ['RANK'])
+is_inference = int(os.environ.get('EVAL', 0)) > 0
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -287,6 +291,61 @@ def pretrain(
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context)
+
+    def generate(v, seed):
+      v.view(-1).normal_(std=0.01, generator=torch.Generator(device='cuda').manual_seed(seed))
+      return v
+
+    import os
+    accum_count = 0
+    with torch.no_grad():
+      for chunk in model:
+        for k, v in chunk.named_parameters():
+          if 'norm.weight' in k or 'layer_norm_weight' in k:                             # For norm weight, all default to original 1.0
+            continue
+          if '.mlp.router.weight' in k or '.mlp.local_moe_layer.gates.0.wg.weight' in k: # Ensure gate.w for both methods keep same seed
+            generate(v, 0)
+          elif '.mlp.linear_fc' in k:
+            fc_id = int(k.split('.linear_fc')[-1].split('.')[0])
+            layer_id = int(k.split('.layers.')[1].split('.')[0])
+            expert_id = 0
+            tp_cnt = int(os.environ.get('TP', 1))
+            seed_hash = fc_id * 3 + layer_id * 7 + expert_id * 11
+            full = generate(torch.empty([tp_cnt, v.numel() // v.size(-1), v.size(-1)], dtype=v.dtype, device=v.device), seed_hash)[global_rank % tp_cnt]
+            v.view(-1).copy_(full.view(-1))
+            if fc_id == 2:
+              v.view(-1).copy_(v.view(v.size(1), v.size(0)).t().reshape(-1))
+          elif '.mlp.experts.local_experts.' in k:                                       # Design static seed for each fc.w on ML-MoE (NEED replace .local_moe_layer. to actual defined varname)
+            fc_id = int(k.split('_fc')[-1].split('_')[0].split('.')[0])
+            layer_id = int(k.split('.layers.')[1].split('.')[0])
+            expert_id = int(k.split('.local_experts.')[1].split('.')[0])
+            tp_cnt = int(os.environ.get('TP', 1))
+            seed_hash = fc_id * 3 + layer_id * 7 + expert_id * 11
+            full = generate(torch.empty([tp_cnt, v.numel() // v.size(-1), v.size(-1)], dtype=v.dtype, device=v.device), seed_hash)[global_rank % tp_cnt]
+            v.view(-1).copy_(full.view(-1))
+            if fc_id == 2:
+              v.view(-1).copy_(v.view(v.size(1), v.size(0)).t().reshape(-1))
+          elif '.local_moe_layer.experts.' in k:                                         # Design static seed for each fc.w on Tutel-MoE (NEED replace .local_moe_layer. to actual defined varname)
+            fc_id = int(k.split('_fc')[-1].split('_')[0].split('.')[0])
+            layer_id = int(k.split('.layers.')[1].split('.')[0])
+            num_local_experts = int(os.environ['TUT'])
+            if num_local_experts == -1:
+              num_local_experts = 1
+            if num_local_experts > 0:
+              for it in range(v.size(0)):
+                expert_id = global_rank * num_local_experts + it
+                seed_hash = fc_id * 3 + layer_id * 7 + expert_id * 11
+                generate(v[it], seed_hash)
+            else:
+              x_times = -num_local_experts
+              expert_id = global_rank // x_times
+              seed_hash = fc_id * 3 + layer_id * 7 + expert_id * 11
+              full = generate(torch.empty([x_times, v.numel() // v.size(-1), v.size(-1)], dtype=v.dtype, device=v.device), seed_hash)[global_rank % x_times]
+              v.copy_(full)
+          else:
+            accum_count += 1
+            generate(v, accum_count)
+
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
@@ -624,6 +683,47 @@ def setup_model_and_optimizer(model_provider_func,
     config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+
+    if distr_opt:
+      from tutel import net
+      # optimizer = net.TutelDistributedOptimizer(model[0].parameters(), group=None, average_shared=True).warp_local(Adam, lr=config.lr, weight_decay=config.weight_decay, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
+      # optimizer.param_groups = optimizer.local_optim.param_groups
+
+      from apex.optimizers import FusedAdam as Adam
+      optimizer = Adam(
+            model[0].parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(config.adam_beta1, config.adam_beta2),
+            eps=config.adam_eps,
+      )
+
+      normal_step = optimizer.step
+
+      def step():
+          with torch.no_grad():
+              from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+              for param_group in optimizer.param_groups:
+                  params = param_group['params']
+                  for param in params:
+                      if not hasattr(param, '_tutel_expert'):
+                          param.grad = net.simple_all_reduce(param.main_grad, inplace=True)
+                      else:
+                          param.grad = param.main_grad
+
+                  grad_norm = 1.0
+                  if False and config.clip_grad > 0.0:
+                      grads_for_norm = [x.grad for x in params] # norm only for unshared
+                      grad_norm = get_grad_norm_fp32(grads_for_norm, model_parallel_group=None) # self.get_model_parallel_group()
+                      clip_grad_by_total_norm_fp32(params, config.clip_grad, grad_norm)
+              success = True # No overflow for FP32 optimizer.
+              normal_step()
+          return success, grad_norm, 0
+
+      optimizer.step = step
+      optimizer.get_loss_scale = lambda: torch.tensor(1.0)
+      optimizer.scale_loss = lambda loss: optimizer.get_loss_scale() * loss
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.moe_use_upcycling:
@@ -716,7 +816,18 @@ def train_step(forward_step_func, data_iterator,
         seq_length=args.seq_length,
         micro_batch_size=args.micro_batch_size,
         decoder_seq_length=args.decoder_seq_length,
-        forward_only=False)
+        forward_only=is_inference)
+
+    '''
+    for k, v in model[0].named_parameters():
+        print([global_rank, k, v.float().sum().item(), v.shape, v.dtype])
+    if global_rank == 0:
+       print(losses_reduced)
+    import time, os; time.sleep(5); # os._exit(0) '''
+
+    if is_inference:
+        update_successful, grad_norm, num_zeros_in_grad = True, 2.0, None
+        return {}, int(not update_successful), grad_norm, num_zeros_in_grad
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1277,7 +1388,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         learning_rate = None
         decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
-            if param_group['is_decoupled_lr']:
+            if param_group.get('is_decoupled_lr', False):
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
